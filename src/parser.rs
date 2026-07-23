@@ -18,6 +18,13 @@ pub(crate) type ParseResult<T> = Result<T, ParseError>;
 const FRAGMENT: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'<').add(b'>').add(b'`');
 /// <https://url.spec.whatwg.org/#path-percent-encode-set>
 const PATH: &AsciiSet = &FRAGMENT.add(b'#').add(b'?').add(b'{').add(b'}');
+/// Like [`PATH`], but also escapes `/` and `%` — used when a single path
+/// *segment* string (not a full path) is being percent-encoded, so a
+/// literal `/` in the segment can't be mistaken for a separator.
+const PATH_SEGMENT: &AsciiSet = &PATH.add(b'/').add(b'%');
+/// [`PATH_SEGMENT`], plus `\`, for special schemes where backslash is also
+/// a path separator.
+const SPECIAL_PATH_SEGMENT: &AsciiSet = &PATH_SEGMENT.add(b'\\');
 /// <https://url.spec.whatwg.org/#userinfo-percent-encode-set>
 pub(crate) const USERINFO: &AsciiSet = &PATH
     .add(b'/')
@@ -72,7 +79,7 @@ pub(crate) fn default_port(scheme: &str) -> Option<u16> {
     }
 }
 
-fn to_u32(n: usize) -> ParseResult<u32> {
+pub(crate) fn to_u32(n: usize) -> ParseResult<u32> {
     u32::try_from(n).map_err(|_| ParseError::Overflow)
 }
 
@@ -187,16 +194,20 @@ impl Iterator for Input<'_> {
 /// Distinguishes top-level URL parsing (`Url::parse`) from setter re-parsing
 /// of a single already-isolated component (`Url::set_path`, etc.), which
 /// don't treat an embedded `?`/`#` as starting a new component — the
-/// setter's input string *is* that one component, nothing more.
+/// setter's input string *is* that one component, nothing more. A third
+/// variant, `PathSegmentSetter`, is for `PathSegmentsMut::extend`: each
+/// segment string is one opaque path segment, so even `/` and `%` within it
+/// must be escaped rather than treated as a separator or existing encoding.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(crate) enum Context {
     UrlParser,
     Setter,
+    PathSegmentSetter,
 }
 
 pub(crate) struct Parser<'a> {
     pub(crate) serialization: String,
-    context: Context,
+    pub(crate) context: Context,
     base_url: Option<&'a Url>,
 }
 
@@ -932,11 +943,27 @@ impl<'a> Parser<'a> {
         path_start: usize,
         mut input: Input<'i>,
     ) -> Input<'i> {
-        fn push_pending(serialization: &mut String, start_str: &str, remaining_len: usize) {
+        fn push_pending(
+            serialization: &mut String,
+            start_str: &str,
+            remaining_len: usize,
+            context: Context,
+            scheme_type: SchemeType,
+        ) {
             let text = &start_str[..start_str.len() - remaining_len];
-            if !text.is_empty() {
-                serialization.push_str(&utf8_percent_encode(text, PATH));
+            if text.is_empty() {
+                return;
             }
+            let set = if context == Context::PathSegmentSetter {
+                if scheme_type.is_special() {
+                    SPECIAL_PATH_SEGMENT
+                } else {
+                    PATH_SEGMENT
+                }
+            } else {
+                PATH
+            };
+            serialization.push_str(&utf8_percent_encode(text, set));
         }
 
         loop {
@@ -948,7 +975,13 @@ impl<'a> Parser<'a> {
                 let c = if let Some(c) = input.chars.next() {
                     c
                 } else {
-                    push_pending(&mut self.serialization, start_str, 0);
+                    push_pending(
+                        &mut self.serialization,
+                        start_str,
+                        0,
+                        self.context,
+                        scheme_type,
+                    );
                     break;
                 };
                 match c {
@@ -957,24 +990,32 @@ impl<'a> Parser<'a> {
                             &mut self.serialization,
                             start_str,
                             input_before_c.chars.as_str().len(),
+                            self.context,
+                            scheme_type,
                         );
                         start_str = input.chars.as_str();
                     }
-                    '/' => {
+                    '/' if self.context != Context::PathSegmentSetter => {
                         push_pending(
                             &mut self.serialization,
                             start_str,
                             input_before_c.chars.as_str().len(),
+                            self.context,
+                            scheme_type,
                         );
                         self.serialization.push('/');
                         ends_with_slash = true;
                         break;
                     }
-                    '\\' if scheme_type.is_special() => {
+                    '\\' if self.context != Context::PathSegmentSetter
+                        && scheme_type.is_special() =>
+                    {
                         push_pending(
                             &mut self.serialization,
                             start_str,
                             input_before_c.chars.as_str().len(),
+                            self.context,
+                            scheme_type,
                         );
                         self.serialization.push('/');
                         ends_with_slash = true;
@@ -985,6 +1026,8 @@ impl<'a> Parser<'a> {
                             &mut self.serialization,
                             start_str,
                             input_before_c.chars.as_str().len(),
+                            self.context,
+                            scheme_type,
                         );
                         input = input_before_c;
                         break;
