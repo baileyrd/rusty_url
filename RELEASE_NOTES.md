@@ -56,3 +56,11 @@
   URLs spanning special/non-special/`file:`/cannot-be-a-base schemes and
   missing-component (empty-range) cases — byte-for-byte identical output.
   (#9)
+- Add `Url::path_segments`/`path_segments_mut` and `PathSegmentsMut`
+  (`push`/`pop`/`pop_if_empty`/`extend`/`clear`). Introduces a third
+  parser `Context` (`PathSegmentSetter`) so `extend()` treats each segment
+  string as one opaque unit — `/` and `%` within it get percent-encoded
+  rather than read as a separator or existing escape. Verified against
+  the reference `url` crate's own documented examples plus additional
+  cases (non-special scheme, multi-segment `extend`) — byte-for-byte
+  identical output. (#10)

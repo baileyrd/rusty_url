@@ -266,6 +266,26 @@ impl Url {
         }
     }
 
+    /// Unless this URL is cannot-be-a-base, return an iterator of `/`-
+    /// separated path segments, each a percent-encoded ASCII string.
+    ///
+    /// When `Some` is returned, the iterator always yields at least one
+    /// string (possibly empty).
+    pub fn path_segments(&self) -> Option<std::str::Split<'_, char>> {
+        self.path().strip_prefix('/').map(|rest| rest.split('/'))
+    }
+
+    /// Return a [`PathSegmentsMut`] for editing this URL's path as a
+    /// sequence of segments. Fails if this URL is cannot-be-a-base.
+    #[allow(clippy::result_unit_err)]
+    pub fn path_segments_mut(&mut self) -> Result<crate::PathSegmentsMut<'_>, ()> {
+        if self.cannot_be_a_base() {
+            Err(())
+        } else {
+            Ok(crate::path_segments::new(self))
+        }
+    }
+
     /// Return the query string (without the leading `?`), if any.
     pub fn query(&self) -> Option<&str> {
         let query_start = self.query_start?;
@@ -647,7 +667,7 @@ impl Url {
         self.restore_after_path(old_after_path_pos, &after_path);
     }
 
-    fn take_after_path(&mut self) -> String {
+    pub(crate) fn take_after_path(&mut self) -> String {
         match (self.query_start, self.fragment_start) {
             (Some(i), _) | (None, Some(i)) => {
                 let after_path = self.serialization[i as usize..].to_owned();
@@ -658,7 +678,7 @@ impl Url {
         }
     }
 
-    fn restore_after_path(&mut self, old_after_path_position: u32, after_path: &str) {
+    pub(crate) fn restore_after_path(&mut self, old_after_path_position: u32, after_path: &str) {
         let new_after_path_position = self.serialization.len() as u32;
         let adjust = |index: &mut u32| {
             *index = *index - old_after_path_position + new_after_path_position;
@@ -743,14 +763,14 @@ impl Url {
         self.serialization.truncate(start);
     }
 
-    fn mutate<F: FnOnce(&mut Parser) -> R, R>(&mut self, f: F) -> R {
+    pub(crate) fn mutate<F: FnOnce(&mut Parser) -> R, R>(&mut self, f: F) -> R {
         let mut parser = Parser::for_setter(mem::take(&mut self.serialization));
         let result = f(&mut parser);
         self.serialization = parser.serialization;
         result
     }
 
-    fn byte_at(&self, i: u32) -> u8 {
+    pub(crate) fn byte_at(&self, i: u32) -> u8 {
         self.serialization.as_bytes()[i as usize]
     }
 }
@@ -1355,5 +1375,78 @@ mod tests {
         let url = Url::parse("https://example.net/a/d/e.html?y=2").unwrap();
         let relative = base.make_relative(&url).unwrap();
         assert_eq!(base.join(&relative).unwrap(), url);
+    }
+
+    #[test]
+    fn path_segments_iterates_slash_separated() {
+        let url = Url::parse("https://example.com/a/b/c").unwrap();
+        let segments: Vec<_> = url.path_segments().unwrap().collect();
+        assert_eq!(segments, vec!["a", "b", "c"]);
+
+        let url = Url::parse("https://example.com/").unwrap();
+        let segments: Vec<_> = url.path_segments().unwrap().collect();
+        assert_eq!(segments, vec![""]);
+    }
+
+    #[test]
+    fn path_segments_none_for_cannot_be_a_base() {
+        let url = Url::parse("data:text/plain,x").unwrap();
+        assert!(url.path_segments().is_none());
+    }
+
+    #[test]
+    fn path_segments_mut_pop_and_push() {
+        let mut url = Url::parse("http://example.net/foo/index.html").unwrap();
+        url.path_segments_mut()
+            .unwrap()
+            .pop()
+            .push("img")
+            .push("2/100%.png");
+        assert_eq!(url.as_str(), "http://example.net/foo/img/2%2F100%25.png");
+    }
+
+    #[test]
+    fn path_segments_mut_clear_and_push() {
+        let mut url = Url::parse("https://github.com/servo/rust-url/").unwrap();
+        url.path_segments_mut().unwrap().clear().push("logout");
+        assert_eq!(url.as_str(), "https://github.com/logout");
+    }
+
+    #[test]
+    fn path_segments_mut_pop_if_empty() {
+        let mut url = Url::parse("https://github.com/servo/rust-url/").unwrap();
+        url.path_segments_mut().unwrap().push("pulls");
+        assert_eq!(url.as_str(), "https://github.com/servo/rust-url//pulls");
+
+        let mut url = Url::parse("https://github.com/servo/rust-url/").unwrap();
+        url.path_segments_mut()
+            .unwrap()
+            .pop_if_empty()
+            .push("pulls");
+        assert_eq!(url.as_str(), "https://github.com/servo/rust-url/pulls");
+    }
+
+    #[test]
+    fn path_segments_mut_extend_skips_dot_segments() {
+        let mut url = Url::parse("https://github.com/servo").unwrap();
+        url.path_segments_mut()
+            .unwrap()
+            .extend(["..", "rust-url", ".", "pulls"]);
+        assert_eq!(url.as_str(), "https://github.com/servo/rust-url/pulls");
+    }
+
+    #[test]
+    fn path_segments_mut_extend_over_several_segments() {
+        let mut url = Url::parse("https://github.com/").unwrap();
+        url.path_segments_mut()
+            .unwrap()
+            .extend(["servo", "rust-url", "issues", "188"]);
+        assert_eq!(url.as_str(), "https://github.com/servo/rust-url/issues/188");
+    }
+
+    #[test]
+    fn path_segments_mut_fails_for_cannot_be_a_base() {
+        let mut url = Url::parse("mailto:me@example.com").unwrap();
+        assert!(url.path_segments_mut().is_err());
     }
 }
