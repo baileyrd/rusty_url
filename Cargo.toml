@@ -10,5 +10,6 @@ keywords = ["url", "parser", "whatwg"]
 categories = ["parser-implementations", "web-programming"]
 
 [dependencies]
+idna = "1"
 
 [dev-dependencies]

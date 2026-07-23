@@ -4,5 +4,8 @@
 //! in the repository root for the tracked parity roadmap.
 
 mod error;
+mod host;
+mod percent_encode;
 
 pub use error::ParseError;
+pub use host::Host;
