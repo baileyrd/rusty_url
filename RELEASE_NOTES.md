@@ -26,3 +26,8 @@
   `ParseOptions::base_url` are later issues. Differentially tested against
   55 cases from the reference `url` crate (byte-for-byte identical output).
   (#5)
+- Add `Origin`/`OpaqueOrigin` and `Url::origin()`: `(scheme, host, port)`
+  tuple origins for `ftp`/`http`/`https`/`ws`/`wss`, recursive origin
+  resolution for `blob:` URLs, and opaque (equal-only-to-itself) origins
+  for everything else, plus `ascii_serialization`/`unicode_serialization`.
+  (#6)
