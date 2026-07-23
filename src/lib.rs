@@ -5,9 +5,12 @@
 
 mod error;
 mod host;
+mod parser;
 mod percent_encode;
+mod url;
 
 pub mod form_urlencoded;
 
 pub use error::ParseError;
 pub use host::Host;
+pub use url::Url;
