@@ -26,9 +26,6 @@ impl AsciiSet {
         !byte.is_ascii() || self.contains(byte)
     }
 
-    // Unused outside tests until the `Url` core parser (a later parity-loop
-    // issue) builds its per-component encode sets on top of `CONTROLS`.
-    #[allow(dead_code)]
     pub(crate) const fn add(&self, byte: u8) -> Self {
         let mut mask = self.mask;
         mask[byte as usize / BITS_PER_CHUNK] |= 1 << (byte as usize % BITS_PER_CHUNK);

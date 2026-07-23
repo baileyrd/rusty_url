@@ -8,6 +8,28 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use crate::percent_encode::{percent_decode, utf8_percent_encode, CONTROLS};
 use crate::ParseError;
 
+/// A [`Host`]'s data without the borrowed/owned string, stored inline in a
+/// [`crate::Url`] (whose `Domain` case is a byte range into the URL's own
+/// serialization instead of a separate allocation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostInternal {
+    None,
+    Domain,
+    Ipv4(Ipv4Addr),
+    Ipv6(Ipv6Addr),
+}
+
+impl From<Host<String>> for HostInternal {
+    fn from(host: Host<String>) -> Self {
+        match host {
+            Host::Domain(s) if s.is_empty() => HostInternal::None,
+            Host::Domain(_) => HostInternal::Domain,
+            Host::Ipv4(addr) => HostInternal::Ipv4(addr),
+            Host::Ipv6(addr) => HostInternal::Ipv6(addr),
+        }
+    }
+}
+
 /// The host name of a URL: a domain, an IPv4 address, or an IPv6 address.
 ///
 /// `S` is the string type used for [`Host::Domain`] — usually `String` (the
