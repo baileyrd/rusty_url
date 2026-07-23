@@ -38,10 +38,99 @@ impl Url {
     /// # Errors
     ///
     /// Returns [`ParseError::RelativeUrlWithoutBase`] if `input` has no
-    /// scheme (this crate does not yet support parsing relative to a base
-    /// URL), or another [`ParseError`] variant if `input` is malformed.
+    /// scheme — use [`Url::join`] to parse a possibly-relative reference
+    /// against a base URL — or another [`ParseError`] variant if `input`
+    /// is malformed.
     pub fn parse(input: &str) -> Result<Self, ParseError> {
         Parser::parse_url(input)
+    }
+
+    /// Parse `input`, resolving it against `self` as a base URL if `input`
+    /// is a relative reference. The inverse of [`Url::make_relative`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError::RelativeUrlWithCannotBeABaseBase`] if `self`
+    /// is cannot-be-a-base, or another [`ParseError`] variant if `input`
+    /// (resolved against `self`) is malformed.
+    pub fn join(&self, input: &str) -> Result<Self, ParseError> {
+        Parser::parse_url_with_base(input, self)
+    }
+
+    /// Make a relative URL that, when [`Url::join`]ed to `self`, yields
+    /// `url`. Returns `None` if `self` is cannot-be-a-base, or if `self`
+    /// and `url` don't share a scheme, host, and port (username, password,
+    /// query, and fragment are not considered part of that comparison).
+    pub fn make_relative(&self, url: &Self) -> Option<String> {
+        if self.cannot_be_a_base() {
+            return None;
+        }
+        if self.scheme() != url.scheme() || self.host() != url.host() || self.port() != url.port() {
+            return None;
+        }
+
+        let mut relative = String::new();
+
+        fn split_path_and_filename(s: &str) -> (&str, &str) {
+            let last_slash = s.rfind('/').unwrap_or(0);
+            let (path, filename) = s.split_at(last_slash);
+            match filename.strip_prefix('/') {
+                Some(filename) if !filename.is_empty() => (path, filename),
+                _ => (path, ""),
+            }
+        }
+
+        let (base_path, base_filename) = split_path_and_filename(self.path());
+        let (url_path, url_filename) = split_path_and_filename(url.path());
+
+        let mut base_segments = base_path.split('/').peekable();
+        let mut url_segments = url_path.split('/').peekable();
+
+        while base_segments.peek().is_some() && base_segments.peek() == url_segments.peek() {
+            base_segments.next();
+            url_segments.next();
+        }
+
+        for segment in base_segments {
+            // The final empty segment (from the trailing '/' before the
+            // filename) doesn't correspond to a directory to climb out of.
+            if segment.is_empty() {
+                break;
+            }
+            if !relative.is_empty() {
+                relative.push('/');
+            }
+            relative.push_str("..");
+        }
+
+        for segment in url_segments {
+            if !relative.is_empty() {
+                relative.push('/');
+            }
+            relative.push_str(segment);
+        }
+
+        if !relative.is_empty() || base_filename != url_filename {
+            if url_filename.is_empty() {
+                relative.push('/');
+            } else {
+                if !relative.is_empty() {
+                    relative.push('/');
+                }
+                relative.push_str(url_filename);
+            }
+        }
+
+        if let Some(query) = url.query() {
+            relative.push('?');
+            relative.push_str(query);
+        }
+        if let Some(fragment) = url.fragment() {
+            relative.push('#');
+            relative.push_str(fragment);
+        }
+
+        Some(relative)
     }
 
     /// Return the serialization of this URL.
@@ -1151,5 +1240,120 @@ mod tests {
 
         let mut url = Url::parse("http://example.net").unwrap();
         assert!(url.set_scheme("foo").is_err());
+    }
+
+    #[test]
+    fn join_relative_path() {
+        let base = Url::parse("https://example.net/a/b.html").unwrap();
+        assert_eq!(
+            base.join("c.png").unwrap().as_str(),
+            "https://example.net/a/c.png"
+        );
+
+        let base = Url::parse("https://example.net/a/b/").unwrap();
+        assert_eq!(
+            base.join("c.png").unwrap().as_str(),
+            "https://example.net/a/b/c.png"
+        );
+    }
+
+    #[test]
+    fn join_absolute_path_and_scheme_relative() {
+        let base = Url::parse("https://example.net/a/b/").unwrap();
+        assert_eq!(
+            base.join("/absolute").unwrap().as_str(),
+            "https://example.net/absolute"
+        );
+        assert_eq!(
+            base.join("//other.example/x").unwrap().as_str(),
+            "https://other.example/x"
+        );
+        assert_eq!(
+            base.join("http://other.example/y").unwrap().as_str(),
+            "http://other.example/y"
+        );
+    }
+
+    #[test]
+    fn join_query_and_fragment_only() {
+        let base = Url::parse("https://example.net/a/b/?old=1#frag").unwrap();
+        assert_eq!(
+            base.join("?new=2").unwrap().as_str(),
+            "https://example.net/a/b/?new=2"
+        );
+        assert_eq!(
+            base.join("#other").unwrap().as_str(),
+            "https://example.net/a/b/?old=1#other"
+        );
+        assert_eq!(
+            base.join("").unwrap().as_str(),
+            "https://example.net/a/b/?old=1"
+        );
+    }
+
+    #[test]
+    fn join_dot_segments_and_backslash() {
+        let base = Url::parse("https://example.net/a/b/").unwrap();
+        assert_eq!(
+            base.join("./x/./y/../z").unwrap().as_str(),
+            "https://example.net/a/b/x/z"
+        );
+        assert_eq!(
+            base.join("\\backslash").unwrap().as_str(),
+            "https://example.net/backslash"
+        );
+    }
+
+    #[test]
+    fn join_file_url_windows_drive_inheritance() {
+        let base = Url::parse("file:///C:/Users/foo/").unwrap();
+        assert_eq!(
+            base.join("../baz.txt").unwrap().as_str(),
+            "file:///C:/Users/baz.txt"
+        );
+        let base = Url::parse("file:///C:/Users/foo/bar.txt").unwrap();
+        assert_eq!(base.join("D:/other.txt").unwrap().as_str(), "d:/other.txt");
+    }
+
+    #[test]
+    fn join_fails_for_cannot_be_a_base() {
+        let base = Url::parse("data:text/plain,hello").unwrap();
+        assert_eq!(
+            base.join("world"),
+            Err(ParseError::RelativeUrlWithCannotBeABaseBase)
+        );
+    }
+
+    #[test]
+    fn make_relative_basic_and_climbing() {
+        let base = Url::parse("https://example.net/a/b.html").unwrap();
+        let url = Url::parse("https://example.net/a/c.png").unwrap();
+        assert_eq!(base.make_relative(&url).as_deref(), Some("c.png"));
+
+        let base = Url::parse("https://example.net/a/b/").unwrap();
+        let url = Url::parse("https://example.net/a/d/c.png").unwrap();
+        assert_eq!(base.make_relative(&url).as_deref(), Some("../d/c.png"));
+    }
+
+    #[test]
+    fn make_relative_query_only() {
+        let base = Url::parse("https://example.net/a/b.html?c=d").unwrap();
+        let url = Url::parse("https://example.net/a/b.html?e=f").unwrap();
+        assert_eq!(base.make_relative(&url).as_deref(), Some("?e=f"));
+    }
+
+    #[test]
+    fn make_relative_none_for_different_origin() {
+        let base = Url::parse("https://example.net/a/b/").unwrap();
+        let url = Url::parse("https://other.example/a/b/").unwrap();
+        assert_eq!(base.make_relative(&url), None);
+    }
+
+    #[test]
+    fn make_relative_is_inverse_of_join() {
+        let base = Url::parse("https://example.net/a/b/c.html?x=1#f").unwrap();
+        let url = Url::parse("https://example.net/a/d/e.html?y=2").unwrap();
+        let relative = base.make_relative(&url).unwrap();
+        assert_eq!(base.join(&relative).unwrap(), url);
     }
 }

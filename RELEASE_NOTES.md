@@ -40,3 +40,12 @@
   `has_host()` true with an empty-string domain rather than clearing to
   no host — verified against the reference `url` crate across 31
   setter-call cases (byte-for-byte identical output). (#7)
+- Add `Url::join` and `Url::make_relative`. `join` required adding the
+  base-relative branches to the parser that were deliberately deferred in
+  #5 (`parse_relative`, `fragment_only`, and `file:`-scheme base
+  inheritance, including the Windows-drive-letter case); `make_relative`
+  is pure string logic over two already-parsed URLs, no parser changes
+  needed. Verified against the reference `url` crate across 29 `join`
+  cases and 12 `make_relative` cases (byte-for-byte identical output),
+  including scheme-relative/absolute/dot-segment resolution, `file:`
+  drive-letter inheritance, and cannot-be-a-base rejection. (#8)

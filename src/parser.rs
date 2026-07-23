@@ -1,7 +1,8 @@
 //! The [WHATWG basic URL parser](https://url.spec.whatwg.org/#url-parsing),
-//! trimmed to the base-URL-free case (`Url::parse`). Base-relative parsing
-//! (`Url::join`, `ParseOptions::base_url`) is a later parity-loop issue and
-//! will extend this module rather than duplicate it.
+//! covering both `Url::parse` (no base) and base-relative parsing
+//! (`Url::join`). A public `ParseOptions` builder over the same base-url
+//! machinery, plus encoding overrides and syntax-violation callbacks, is a
+//! later parity-loop issue.
 
 use std::fmt::Write as _;
 use std::str::Chars;
@@ -193,24 +194,54 @@ pub(crate) enum Context {
     Setter,
 }
 
-pub(crate) struct Parser {
+pub(crate) struct Parser<'a> {
     pub(crate) serialization: String,
     context: Context,
+    base_url: Option<&'a Url>,
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     /// <https://url.spec.whatwg.org/#concept-basic-url-parser>, without an
-    /// input base URL (base-relative parsing is added by a later issue).
+    /// input base URL.
     pub(crate) fn parse_url(input: &str) -> ParseResult<Url> {
         let mut parser = Parser {
             serialization: String::with_capacity(input.len()),
             context: Context::UrlParser,
+            base_url: None,
         };
         let input = Input::new(input);
         if let Ok(remaining) = parser.parse_scheme(input) {
             return parser.parse_with_scheme(remaining);
         }
         Err(ParseError::RelativeUrlWithoutBase)
+    }
+
+    /// <https://url.spec.whatwg.org/#concept-basic-url-parser>, resolving a
+    /// possibly-relative `input` against `base_url` (`Url::join`).
+    pub(crate) fn parse_url_with_base(input: &str, base_url: &'a Url) -> ParseResult<Url> {
+        let mut parser = Parser {
+            serialization: String::with_capacity(input.len()),
+            context: Context::UrlParser,
+            base_url: Some(base_url),
+        };
+        let input = Input::new(input);
+        if let Ok(remaining) = parser.parse_scheme(input.clone()) {
+            return parser.parse_with_scheme(remaining);
+        }
+
+        // No-scheme state: fall back to the base URL.
+        if input.starts_with_char('#') {
+            parser.fragment_only(base_url, input)
+        } else if base_url.cannot_be_a_base() {
+            Err(ParseError::RelativeUrlWithCannotBeABaseBase)
+        } else {
+            let scheme_type = SchemeType::from(base_url.scheme());
+            if scheme_type.is_file() {
+                parser.parse_file(input, Some(base_url))
+            } else {
+                parser.parse_relative(input, scheme_type, base_url)
+            }
+        }
     }
 
     /// A parser for re-parsing one component of an already-valid `Url` (a
@@ -221,6 +252,7 @@ impl Parser {
         Parser {
             serialization,
             context: Context::Setter,
+            base_url: None,
         }
     }
 
@@ -255,11 +287,20 @@ impl Parser {
         self.serialization.push(':');
         match scheme_type {
             SchemeType::File => {
+                let base_file_url = self.base_url.filter(|base| base.scheme() == "file");
                 self.serialization.clear();
-                self.parse_file(input)
+                self.parse_file(input, base_file_url)
             }
             SchemeType::SpecialNotFile => {
-                let (_, remaining) = input.count_matching(|c| matches!(c, '/' | '\\'));
+                let (slashes_count, remaining) = input.count_matching(|c| matches!(c, '/' | '\\'));
+                if let Some(base_url) = self.base_url {
+                    if slashes_count < 2
+                        && base_url.scheme() == &self.serialization[..scheme_end as usize]
+                    {
+                        self.serialization.clear();
+                        return self.parse_relative(input, scheme_type, base_url);
+                    }
+                }
                 self.after_double_slash(remaining, scheme_type, scheme_end)
             }
             SchemeType::NotSpecial => self.parse_non_special(input, scheme_type, scheme_end),
@@ -299,7 +340,7 @@ impl Parser {
         )
     }
 
-    fn parse_file(mut self, input: Input<'_>) -> ParseResult<Url> {
+    fn parse_file(mut self, input: Input<'_>, base_file_url: Option<&Url>) -> ParseResult<Url> {
         debug_assert!(self.serialization.is_empty());
         let scheme_end = "file".len() as u32;
         let (first_char, input_after_first_char) = input.split_first();
@@ -343,19 +384,137 @@ impl Parser {
                     fragment_start,
                 });
             }
-            // file slash state, no host
+            // file slash state, single '/' or '\\' not followed by another:
+            // may inherit a host or Windows drive letter from the base URL.
+            self.serialization.push_str("file://");
+            let host_start = "file://".len();
+            let mut host_end = host_start;
+            let mut host = HostInternal::None;
+            if !starts_with_windows_drive_letter_segment(&input_after_first_char) {
+                if let Some(base_url) = base_file_url {
+                    let first_segment = first_path_segment(base_url);
+                    if is_normalized_windows_drive_letter(first_segment) {
+                        self.serialization.push('/');
+                        self.serialization.push_str(first_segment);
+                    } else if let Some(host_str) = base_url.host_str() {
+                        self.serialization.push_str(host_str);
+                        host_end = self.serialization.len();
+                        host = base_url.host;
+                    }
+                }
+            }
+            // Keep the leading '/' in the input fed to parse_path so it
+            // becomes the path's own leading slash when there's no host.
+            let parse_path_input = match first_char {
+                Some('/') | Some('\\') | Some('?') | Some('#') => input,
+                _ => input_after_first_char,
+            };
+            let remaining =
+                self.parse_path(SchemeType::File, &mut false, host_end, parse_path_input);
+            let host_start = host_start as u32;
+            let (query_start, fragment_start) =
+                self.parse_query_and_fragment(scheme_end, remaining)?;
+            let host_end = host_end as u32;
+            return Ok(Url {
+                serialization: self.serialization,
+                scheme_end,
+                username_end: host_start,
+                host_start,
+                host_end,
+                host,
+                port: None,
+                path_start: host_end,
+                query_start,
+                fragment_start,
+            });
+        }
+        if let Some(base_url) = base_file_url {
+            match first_char {
+                None => {
+                    let before_fragment = match base_url.fragment_start {
+                        Some(i) => &base_url.serialization[..i as usize],
+                        None => base_url.serialization.as_str(),
+                    };
+                    self.serialization.push_str(before_fragment);
+                    Ok(Url {
+                        serialization: self.serialization,
+                        fragment_start: None,
+                        ..*base_url
+                    })
+                }
+                Some('?') => {
+                    let before_query = match (base_url.query_start, base_url.fragment_start) {
+                        (None, None) => base_url.serialization.as_str(),
+                        (Some(i), _) | (None, Some(i)) => &base_url.serialization[..i as usize],
+                    };
+                    self.serialization.push_str(before_query);
+                    let (query_start, fragment_start) =
+                        self.parse_query_and_fragment(base_url.scheme_end, input)?;
+                    Ok(Url {
+                        serialization: self.serialization,
+                        query_start,
+                        fragment_start,
+                        ..*base_url
+                    })
+                }
+                Some('#') => self.fragment_only(base_url, input),
+                _ => {
+                    if !starts_with_windows_drive_letter_segment(&input) {
+                        let before_query = match (base_url.query_start, base_url.fragment_start) {
+                            (None, None) => base_url.serialization.as_str(),
+                            (Some(i), _) | (None, Some(i)) => &base_url.serialization[..i as usize],
+                        };
+                        self.serialization.push_str(before_query);
+                        self.shorten_path(SchemeType::File, base_url.path_start as usize);
+                        let remaining = self.parse_path(
+                            SchemeType::File,
+                            &mut true,
+                            base_url.path_start as usize,
+                            input,
+                        );
+                        self.finish(
+                            base_url.scheme_end,
+                            base_url.username_end,
+                            base_url.host_start,
+                            base_url.host_end,
+                            base_url.host,
+                            base_url.port,
+                            base_url.path_start,
+                            remaining,
+                        )
+                    } else {
+                        self.serialization.push_str("file:///");
+                        let path_start = "file://".len();
+                        let remaining =
+                            self.parse_path(SchemeType::File, &mut false, path_start, input);
+                        let (query_start, fragment_start) =
+                            self.parse_query_and_fragment(scheme_end, remaining)?;
+                        let path_start = path_start as u32;
+                        Ok(Url {
+                            serialization: self.serialization,
+                            scheme_end,
+                            username_end: path_start,
+                            host_start: path_start,
+                            host_end: path_start,
+                            host: HostInternal::None,
+                            port: None,
+                            path_start,
+                            query_start,
+                            fragment_start,
+                        })
+                    }
+                }
+            }
+        } else {
+            // file state, next char is not '/' or '\\' (or EOF), and no base:
+            // no authority slashes at all.
             self.serialization.push_str("file:///");
             let path_start = "file://".len();
-            let remaining = self.parse_path(
-                SchemeType::File,
-                &mut false,
-                path_start,
-                input_after_first_char,
-            );
+            let remaining = self.parse_path(SchemeType::File, &mut false, path_start, input);
             let (query_start, fragment_start) =
                 self.parse_query_and_fragment(scheme_end, remaining)?;
             let path_start = path_start as u32;
-            return Ok(Url {
+            Ok(Url {
                 serialization: self.serialization,
                 scheme_end,
                 username_end: path_start,
@@ -366,25 +525,135 @@ impl Parser {
                 path_start,
                 query_start,
                 fragment_start,
-            });
+            })
         }
-        // file state, next char is not '/' or '\' (or EOF): no authority slashes at all.
-        self.serialization.push_str("file:///");
-        let path_start = "file://".len();
-        let remaining = self.parse_path(SchemeType::File, &mut false, path_start, input);
-        let (query_start, fragment_start) = self.parse_query_and_fragment(scheme_end, remaining)?;
-        let path_start = path_start as u32;
+    }
+
+    /// <https://url.spec.whatwg.org/#relative-state> — `input` has no
+    /// scheme, so it's resolved relative to `base_url` (`Url::join`).
+    /// `base_url`'s scheme is not `file` (that's handled by `parse_file`).
+    fn parse_relative(
+        mut self,
+        input: Input<'_>,
+        scheme_type: SchemeType,
+        base_url: &Url,
+    ) -> ParseResult<Url> {
+        debug_assert!(self.serialization.is_empty());
+        let (first_char, input_after_first_char) = input.split_first();
+        match first_char {
+            None => {
+                let before_fragment = match base_url.fragment_start {
+                    Some(i) => &base_url.serialization[..i as usize],
+                    None => base_url.serialization.as_str(),
+                };
+                self.serialization.push_str(before_fragment);
+                Ok(Url {
+                    serialization: self.serialization,
+                    fragment_start: None,
+                    ..*base_url
+                })
+            }
+            Some('?') => {
+                let before_query = match (base_url.query_start, base_url.fragment_start) {
+                    (None, None) => base_url.serialization.as_str(),
+                    (Some(i), _) | (None, Some(i)) => &base_url.serialization[..i as usize],
+                };
+                self.serialization.push_str(before_query);
+                let (query_start, fragment_start) =
+                    self.parse_query_and_fragment(base_url.scheme_end, input)?;
+                Ok(Url {
+                    serialization: self.serialization,
+                    query_start,
+                    fragment_start,
+                    ..*base_url
+                })
+            }
+            Some('#') => self.fragment_only(base_url, input),
+            Some('/') | Some('\\') => {
+                let (slashes_count, remaining) = input.count_matching(|c| matches!(c, '/' | '\\'));
+                if slashes_count >= 2 {
+                    let scheme_end = base_url.scheme_end;
+                    self.serialization
+                        .push_str(&base_url.serialization[..scheme_end as usize + 1]);
+                    if let Some(after_prefix) = input.split_prefix_str("//") {
+                        return self.after_double_slash(after_prefix, scheme_type, scheme_end);
+                    }
+                    return self.after_double_slash(remaining, scheme_type, scheme_end);
+                }
+                let path_start = base_url.path_start;
+                self.serialization
+                    .push_str(&base_url.serialization[..path_start as usize]);
+                self.serialization.push('/');
+                let remaining = self.parse_path(
+                    scheme_type,
+                    &mut true,
+                    path_start as usize,
+                    input_after_first_char,
+                );
+                self.finish(
+                    base_url.scheme_end,
+                    base_url.username_end,
+                    base_url.host_start,
+                    base_url.host_end,
+                    base_url.host,
+                    base_url.port,
+                    base_url.path_start,
+                    remaining,
+                )
+            }
+            _ => {
+                let before_query = match (base_url.query_start, base_url.fragment_start) {
+                    (None, None) => base_url.serialization.as_str(),
+                    (Some(i), _) | (None, Some(i)) => &base_url.serialization[..i as usize],
+                };
+                self.serialization.push_str(before_query);
+                self.pop_path(scheme_type, base_url.path_start as usize);
+                // A special URL always has a path, and a path always starts with '/'.
+                if self.serialization.len() == base_url.path_start as usize
+                    && (scheme_type.is_special() || !input.is_empty())
+                {
+                    self.serialization.push('/');
+                }
+                let remaining = match input.split_first() {
+                    (Some('/'), remaining) => self.parse_path(
+                        scheme_type,
+                        &mut true,
+                        base_url.path_start as usize,
+                        remaining,
+                    ),
+                    _ => {
+                        self.parse_path(scheme_type, &mut true, base_url.path_start as usize, input)
+                    }
+                };
+                self.finish(
+                    base_url.scheme_end,
+                    base_url.username_end,
+                    base_url.host_start,
+                    base_url.host_end,
+                    base_url.host,
+                    base_url.port,
+                    base_url.path_start,
+                    remaining,
+                )
+            }
+        }
+    }
+
+    fn fragment_only(mut self, base_url: &Url, input: Input<'_>) -> ParseResult<Url> {
+        let before_fragment = match base_url.fragment_start {
+            Some(i) => &base_url.serialization[..i as usize],
+            None => base_url.serialization.as_str(),
+        };
+        self.serialization.push_str(before_fragment);
+        self.serialization.push('#');
+        let mut input = input;
+        let next = input.next();
+        debug_assert!(next == Some('#'));
+        self.parse_fragment(input);
         Ok(Url {
             serialization: self.serialization,
-            scheme_end,
-            username_end: path_start,
-            host_start: path_start,
-            host_end: path_start,
-            host: HostInternal::None,
-            port: None,
-            path_start,
-            query_start,
-            fragment_start,
+            fragment_start: Some(to_u32(before_fragment.len())?),
+            ..*base_url
         })
     }
 
@@ -971,6 +1240,17 @@ impl Parser {
     }
 }
 
+/// The first `/`-separated path segment, or `""` for a cannot-be-a-base URL
+/// or an empty path. A minimal stand-in for the public `path_segments()`
+/// iterator (a later parity-loop issue) — used only internally here, for
+/// `file:` base-URL Windows-drive-letter inheritance in `parse_file`.
+fn first_path_segment(url: &Url) -> &str {
+    url.path()
+        .strip_prefix('/')
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("")
+}
+
 fn is_windows_drive_letter(segment: &str) -> bool {
     let bytes = segment.as_bytes();
     bytes.len() == 2 && ascii_alpha(bytes[0] as char) && matches!(bytes[1], b':' | b'|')
@@ -990,4 +1270,18 @@ fn path_starts_with_windows_drive_letter(s: &str) -> bool {
         && ascii_alpha(rest_bytes[0] as char)
         && matches!(rest_bytes[1], b':' | b'|')
         && (rest_bytes.len() == 2 || matches!(rest_bytes[2], b'/' | b'\\' | b'?' | b'#'))
+}
+
+/// <https://url.spec.whatwg.org/#start-with-a-windows-drive-letter>
+fn starts_with_windows_drive_letter_segment(input: &Input<'_>) -> bool {
+    let mut input = input.clone();
+    match (input.next(), input.next(), input.next()) {
+        (Some(a), Some(b), Some(c))
+            if ascii_alpha(a) && matches!(b, ':' | '|') && matches!(c, '/' | '\\' | '?' | '#') =>
+        {
+            true
+        }
+        (Some(a), Some(b), None) if ascii_alpha(a) && matches!(b, ':' | '|') => true,
+        _ => false,
+    }
 }
