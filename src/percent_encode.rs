@@ -43,9 +43,20 @@ pub(crate) const CONTROLS: &AsciiSet = &AsciiSet {
     mask: [!0_u32, 0, 0, 1 << (0x7F_u32 % 32)],
 };
 
-fn percent_encode_byte(byte: u8) -> [u8; 3] {
+/// The unconditional `%XX` percent-encoding of a single byte.
+pub(crate) fn percent_encode_byte(byte: u8) -> &'static str {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    [b'%', HEX[(byte >> 4) as usize], HEX[(byte & 0xF) as usize]]
+    static TABLE: [[u8; 3]; 256] = {
+        let mut table = [[0u8; 3]; 256];
+        let mut b = 0usize;
+        while b < 256 {
+            table[b] = [b'%', HEX[b >> 4], HEX[b & 0xF]];
+            b += 1;
+        }
+        table
+    };
+    // SAFETY: every entry is `%` followed by two ASCII hex digits.
+    unsafe { str::from_utf8_unchecked(&TABLE[byte as usize]) }
 }
 
 /// Percent-encode the UTF-8 encoding of `input`, escaping bytes in `ascii_set`
@@ -60,9 +71,7 @@ pub(crate) fn utf8_percent_encode<'a>(
     let mut out = String::with_capacity(input.len());
     for byte in input.bytes() {
         if ascii_set.should_percent_encode(byte) {
-            let enc = percent_encode_byte(byte);
-            // SAFETY: percent_encode_byte only emits ASCII bytes.
-            out.push_str(unsafe { str::from_utf8_unchecked(&enc) });
+            out.push_str(percent_encode_byte(byte));
         } else {
             out.push(byte as char);
         }

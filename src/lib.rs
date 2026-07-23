@@ -7,5 +7,7 @@ mod error;
 mod host;
 mod percent_encode;
 
+pub mod form_urlencoded;
+
 pub use error::ParseError;
 pub use host::Host;
