@@ -10,3 +10,7 @@
   opaque host), plus `Display`/`Clone`/`Eq`/`Ord`/`Hash`. Adds a dependency
   on the `idna` crate for IDNA/punycode domain normalization (by design —
   see #3 discussion). (#3)
+- Add the `form_urlencoded` module: `parse`/`Parse`/`ParseIntoOwned`,
+  `byte_serialize`/`ByteSerialize`, and `Serializer`/`Target`/
+  `EncodingOverride` for building `application/x-www-form-urlencoded`
+  strings. Standalone — no dependency on `Url`. (#4)
