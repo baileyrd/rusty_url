@@ -64,3 +64,10 @@
   the reference `url` crate's own documented examples plus additional
   cases (non-special scheme, multi-segment `extend`) — byte-for-byte
   identical output. (#10)
+- Add `Url::query_pairs`/`query_pairs_mut` and `UrlQuery` (the
+  `form_urlencoded::Target` bridging `query_pairs_mut`'s `Serializer` back
+  into the URL, preserving the fragment across the edit and restoring it
+  when the serializer is finished or dropped). Verified against the
+  reference `url` crate — decoded-pairs iteration, append/clear/extend
+  mutation, fragment preservation, and adding a query to a URL that had
+  none — byte-for-byte identical output. (#11)

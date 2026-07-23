@@ -296,6 +296,46 @@ impl Url {
         })
     }
 
+    /// Parse this URL's query string as `application/x-www-form-urlencoded`
+    /// and return an iterator of `(key, value)` pairs.
+    #[inline]
+    pub fn query_pairs(&self) -> crate::form_urlencoded::Parse<'_> {
+        crate::form_urlencoded::parse(self.query().unwrap_or("").as_bytes())
+    }
+
+    /// Manipulate this URL's query string as a sequence of
+    /// `application/x-www-form-urlencoded` name/value pairs. Method-chains
+    /// like a normal [`form_urlencoded::Serializer`](crate::form_urlencoded::Serializer):
+    ///
+    /// ```
+    /// # use rusty_url::Url;
+    /// let mut url = Url::parse("https://example.net?lang=fr#nav").unwrap();
+    /// url.query_pairs_mut().append_pair("foo", "bar");
+    /// assert_eq!(url.query(), Some("lang=fr&foo=bar"));
+    /// ```
+    ///
+    /// `url.query_pairs_mut().clear()` is equivalent to
+    /// `url.set_query(Some(""))`, not `url.set_query(None)`.
+    pub fn query_pairs_mut(&mut self) -> crate::form_urlencoded::Serializer<'_, UrlQuery<'_>> {
+        let fragment = self.take_fragment();
+
+        let query_start = match self.query_start {
+            Some(start) => start as usize,
+            None => {
+                let start = self.serialization.len();
+                self.query_start = Some(start as u32);
+                self.serialization.push('?');
+                start
+            }
+        };
+
+        let query = UrlQuery {
+            url: Some(self),
+            fragment,
+        };
+        crate::form_urlencoded::Serializer::for_suffix(query, query_start + "?".len())
+    }
+
     /// Return the fragment (without the leading `#`), if any.
     pub fn fragment(&self) -> Option<&str> {
         self.fragment_start
@@ -772,6 +812,38 @@ impl Url {
 
     pub(crate) fn byte_at(&self, i: u32) -> u8 {
         self.serialization.as_bytes()[i as usize]
+    }
+}
+
+/// The [`crate::form_urlencoded::Target`] backing [`Url::query_pairs_mut`].
+///
+/// Not constructible outside this crate — it only exists as the target type
+/// parameter of the `Serializer` that `query_pairs_mut` returns.
+#[derive(Debug)]
+pub struct UrlQuery<'a> {
+    url: Option<&'a mut Url>,
+    fragment: Option<String>,
+}
+
+impl<'a> crate::form_urlencoded::Target for UrlQuery<'a> {
+    type Finished = &'a mut Url;
+
+    fn as_mut_string(&mut self) -> &mut String {
+        &mut self.url.as_mut().unwrap().serialization
+    }
+
+    fn finish(mut self) -> &'a mut Url {
+        let url = self.url.take().unwrap();
+        url.restore_already_parsed_fragment(self.fragment.take());
+        url
+    }
+}
+
+impl Drop for UrlQuery<'_> {
+    fn drop(&mut self) {
+        if let Some(url) = self.url.take() {
+            url.restore_already_parsed_fragment(self.fragment.take());
+        }
     }
 }
 
@@ -1448,5 +1520,62 @@ mod tests {
     fn path_segments_mut_fails_for_cannot_be_a_base() {
         let mut url = Url::parse("mailto:me@example.com").unwrap();
         assert!(url.path_segments_mut().is_err());
+    }
+
+    #[test]
+    fn query_pairs_iterates_decoded_pairs() {
+        let url = Url::parse("https://example.com/products?page=2&sort=desc").unwrap();
+        let pairs: Vec<_> = url.query_pairs().collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    std::borrow::Cow::Borrowed("page"),
+                    std::borrow::Cow::Borrowed("2")
+                ),
+                (
+                    std::borrow::Cow::Borrowed("sort"),
+                    std::borrow::Cow::Borrowed("desc")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn query_pairs_empty_for_no_query() {
+        let url = Url::parse("https://example.com/products").unwrap();
+        assert_eq!(url.query_pairs().count(), 0);
+    }
+
+    #[test]
+    fn query_pairs_mut_append_preserves_fragment() {
+        let mut url = Url::parse("https://example.net?lang=fr#nav").unwrap();
+        url.query_pairs_mut().append_pair("foo", "bar");
+        assert_eq!(url.query(), Some("lang=fr&foo=bar"));
+        assert_eq!(url.as_str(), "https://example.net/?lang=fr&foo=bar#nav");
+    }
+
+    #[test]
+    fn query_pairs_mut_clear_and_append() {
+        let mut url = Url::parse("https://example.net?lang=fr#nav").unwrap();
+        url.query_pairs_mut()
+            .clear()
+            .append_pair("foo", "bar & baz")
+            .append_pair("saisons", "\u{c9}t\u{e9}+hiver");
+        assert_eq!(
+            url.query(),
+            Some("foo=bar+%26+baz&saisons=%C3%89t%C3%A9%2Bhiver")
+        );
+        assert_eq!(
+            url.as_str(),
+            "https://example.net/?foo=bar+%26+baz&saisons=%C3%89t%C3%A9%2Bhiver#nav"
+        );
+    }
+
+    #[test]
+    fn query_pairs_mut_on_url_with_no_prior_query() {
+        let mut url = Url::parse("https://example.net/path").unwrap();
+        url.query_pairs_mut().append_pair("a", "1");
+        assert_eq!(url.as_str(), "https://example.net/path?a=1");
     }
 }
