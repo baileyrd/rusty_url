@@ -66,6 +66,12 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+impl From<idna::Errors> for ParseError {
+    fn from(_: idna::Errors) -> Self {
+        ParseError::IdnaError
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ParseError;
