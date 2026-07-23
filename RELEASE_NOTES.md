@@ -49,3 +49,10 @@
   cases and 12 `make_relative` cases (byte-for-byte identical output),
   including scheme-relative/absolute/dot-segment resolution, `file:`
   drive-letter inheritance, and cannot-be-a-base rejection. (#8)
+- Add `Position` and `Index<Range/RangeFrom/RangeTo/RangeFull<Position>>`
+  for `Url`, letting callers slice the serialized URL string by component
+  boundary (e.g. `&url[Position::BeforeUsername..Position::AfterPort]`
+  for the authority). Verified against the reference `url` crate across 7
+  URLs spanning special/non-special/`file:`/cannot-be-a-base schemes and
+  missing-component (empty-range) cases — byte-for-byte identical output.
+  (#9)
