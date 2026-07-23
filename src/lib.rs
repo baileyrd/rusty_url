@@ -5,6 +5,7 @@
 
 mod error;
 mod host;
+mod origin;
 mod parser;
 mod percent_encode;
 mod url;
@@ -13,4 +14,5 @@ pub mod form_urlencoded;
 
 pub use error::ParseError;
 pub use host::Host;
+pub use origin::{OpaqueOrigin, Origin};
 pub use url::Url;

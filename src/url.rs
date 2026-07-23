@@ -6,6 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 
 use crate::host::{Host, HostInternal};
+use crate::origin::{self, Origin};
 use crate::parser::{self, Parser, SchemeType};
 use crate::ParseError;
 
@@ -62,6 +63,11 @@ impl Url {
     /// schemes (`http`, `https`, `ws`, `wss`, `ftp`, `file`).
     pub fn is_special(&self) -> bool {
         SchemeType::from(self.scheme()).is_special()
+    }
+
+    /// Return this URL's [origin](https://url.spec.whatwg.org/#origin).
+    pub fn origin(&self) -> Origin {
+        origin::url_origin(self)
     }
 
     /// Return whether the URL has an authority (`//` followed by an
