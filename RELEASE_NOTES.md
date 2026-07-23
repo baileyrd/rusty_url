@@ -31,3 +31,12 @@
   resolution for `blob:` URLs, and opaque (equal-only-to-itself) origins
   for everything else, plus `ascii_serialization`/`unicode_serialization`.
   (#6)
+- Add `Url` setters: `set_scheme`/`set_username`/`set_password`/
+  `set_host`/`set_ip_host`/`set_port`/`set_path`/`set_query`/
+  `set_fragment`. Introduces a parser `Context` (URL-parser vs. setter) so
+  re-parsing an isolated component (e.g. `set_path`) doesn't treat an
+  embedded `?`/`#` as starting a new component. Matches the reference
+  crate's documented quirks exactly, including `set_host(None)` leaving
+  `has_host()` true with an empty-string domain rather than clearing to
+  no host — verified against the reference `url` crate across 31
+  setter-call cases (byte-for-byte identical output). (#7)

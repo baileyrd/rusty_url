@@ -18,7 +18,7 @@ const FRAGMENT: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'<').add(b'>').ad
 /// <https://url.spec.whatwg.org/#path-percent-encode-set>
 const PATH: &AsciiSet = &FRAGMENT.add(b'#').add(b'?').add(b'{').add(b'}');
 /// <https://url.spec.whatwg.org/#userinfo-percent-encode-set>
-const USERINFO: &AsciiSet = &PATH
+pub(crate) const USERINFO: &AsciiSet = &PATH
     .add(b'/')
     .add(b':')
     .add(b';')
@@ -92,7 +92,7 @@ fn ascii_alpha(c: char) -> bool {
 /// the URL Standard says these are removed wherever they occur, not just at
 /// the ends of the input.
 #[derive(Clone)]
-struct Input<'i> {
+pub(crate) struct Input<'i> {
     chars: Chars<'i>,
 }
 
@@ -106,8 +106,21 @@ impl<'i> Input<'i> {
         }
     }
 
+    /// No trimming: used by setters, whose input is already an isolated
+    /// component value (a scheme, path, query, or fragment), not a full URL
+    /// string that might have stray leading/trailing whitespace.
+    pub(crate) fn new_no_trim(original: &'i str) -> Self {
+        Input {
+            chars: original.chars(),
+        }
+    }
+
     fn starts_with_char(&self, c: char) -> bool {
         self.clone().next() == Some(c)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.clone().next().is_none()
     }
 
     /// If the input starts with `prefix`, return the input after it.
@@ -170,8 +183,19 @@ impl Iterator for Input<'_> {
     }
 }
 
+/// Distinguishes top-level URL parsing (`Url::parse`) from setter re-parsing
+/// of a single already-isolated component (`Url::set_path`, etc.), which
+/// don't treat an embedded `?`/`#` as starting a new component — the
+/// setter's input string *is* that one component, nothing more.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) enum Context {
+    UrlParser,
+    Setter,
+}
+
 pub(crate) struct Parser {
-    serialization: String,
+    pub(crate) serialization: String,
+    context: Context,
 }
 
 impl Parser {
@@ -180,6 +204,7 @@ impl Parser {
     pub(crate) fn parse_url(input: &str) -> ParseResult<Url> {
         let mut parser = Parser {
             serialization: String::with_capacity(input.len()),
+            context: Context::UrlParser,
         };
         let input = Input::new(input);
         if let Ok(remaining) = parser.parse_scheme(input) {
@@ -188,7 +213,18 @@ impl Parser {
         Err(ParseError::RelativeUrlWithoutBase)
     }
 
-    fn parse_scheme<'i>(&mut self, mut input: Input<'i>) -> Result<Input<'i>, ()> {
+    /// A parser for re-parsing one component of an already-valid `Url` (a
+    /// setter). `serialization` is the buffer to append into — often empty,
+    /// but callers that splice a component back into a larger string (e.g.
+    /// `set_scheme`) pre-fill it.
+    pub(crate) fn for_setter(serialization: String) -> Self {
+        Parser {
+            serialization,
+            context: Context::Setter,
+        }
+    }
+
+    pub(crate) fn parse_scheme<'i>(&mut self, mut input: Input<'i>) -> Result<Input<'i>, ()> {
         if !input.clone().next().is_some_and(ascii_alpha) {
             return Err(());
         }
@@ -203,8 +239,14 @@ impl Parser {
                 }
             }
         }
-        self.serialization.clear();
-        Err(())
+        // EOF before ':': only setters accept a bare scheme with no colon
+        // (`url.set_scheme("http")`, not `"http:"`).
+        if self.context == Context::Setter {
+            Ok(input)
+        } else {
+            self.serialization.clear();
+            Err(())
+        }
     }
 
     fn parse_with_scheme(mut self, input: Input<'_>) -> ParseResult<Url> {
@@ -589,7 +631,7 @@ impl Parser {
         Ok((opt_port, input))
     }
 
-    fn parse_path_start<'i>(
+    pub(crate) fn parse_path_start<'i>(
         &mut self,
         scheme_type: SchemeType,
         has_host: &mut bool,
@@ -614,7 +656,7 @@ impl Parser {
         self.parse_path(scheme_type, has_host, path_start, input)
     }
 
-    fn parse_path<'i>(
+    pub(crate) fn parse_path<'i>(
         &mut self,
         scheme_type: SchemeType,
         has_host: &mut bool,
@@ -669,7 +711,7 @@ impl Parser {
                         ends_with_slash = true;
                         break;
                     }
-                    '?' | '#' => {
+                    '?' | '#' if self.context == Context::UrlParser => {
                         push_pending(
                             &mut self.serialization,
                             start_str,
@@ -775,11 +817,13 @@ impl Parser {
         }
     }
 
-    fn parse_cannot_be_a_base_path<'i>(&mut self, mut input: Input<'i>) -> Input<'i> {
+    pub(crate) fn parse_cannot_be_a_base_path<'i>(&mut self, mut input: Input<'i>) -> Input<'i> {
         loop {
             let input_before_c = input.clone();
             match input.next_utf8() {
-                Some(('?', _)) | Some(('#', _)) => return input_before_c,
+                Some(('?', _)) | Some(('#', _)) if self.context == Context::UrlParser => {
+                    return input_before_c
+                }
                 Some((_, utf8_c)) => {
                     self.serialization
                         .push_str(&utf8_percent_encode(utf8_c, CONTROLS));
@@ -857,8 +901,14 @@ impl Parser {
 
     /// Consume up to (not including) a `#`, percent-encoding into
     /// `self.serialization`. Returns the remaining input starting *after*
-    /// the `#` if one was found, `None` at EOF.
-    fn parse_query<'i>(&mut self, scheme_type: SchemeType, input: Input<'i>) -> Option<Input<'i>> {
+    /// the `#` if one was found, `None` at EOF. In `Setter` context, `#`
+    /// isn't a terminator — the whole input is the query, since the caller
+    /// (`Url::set_query`) already isolated it from any fragment.
+    pub(crate) fn parse_query<'i>(
+        &mut self,
+        scheme_type: SchemeType,
+        input: Input<'i>,
+    ) -> Option<Input<'i>> {
         let set = if scheme_type.is_special() {
             SPECIAL_QUERY
         } else {
@@ -882,7 +932,7 @@ impl Parser {
                         self.serialization.push_str(&utf8_percent_encode(text, set));
                         break;
                     }
-                    Some('#') => {
+                    Some('#') if self.context == Context::UrlParser => {
                         let text = &start[..start.len() - before_len];
                         self.serialization.push_str(&utf8_percent_encode(text, set));
                         return Some(input);
@@ -893,7 +943,7 @@ impl Parser {
         }
     }
 
-    fn parse_fragment(&mut self, input: Input<'_>) {
+    pub(crate) fn parse_fragment(&mut self, input: Input<'_>) {
         let mut input = input;
         loop {
             let start = input.chars.as_str();
