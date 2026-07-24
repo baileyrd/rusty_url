@@ -19,4 +19,4 @@ pub use host::Host;
 pub use origin::{OpaqueOrigin, Origin};
 pub use path_segments::PathSegmentsMut;
 pub use position::Position;
-pub use url::Url;
+pub use url::{Url, UrlQuery};
