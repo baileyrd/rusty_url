@@ -73,10 +73,10 @@ const PATH: &AsciiSet = &FRAGMENT.add(b'#').add(b'?').add(b'{').add(b'}');
 /// Like [`PATH`], but also escapes `/` and `%` — used when a single path
 /// *segment* string (not a full path) is being percent-encoded, so a
 /// literal `/` in the segment can't be mistaken for a separator.
-const PATH_SEGMENT: &AsciiSet = &PATH.add(b'/').add(b'%');
+pub(crate) const PATH_SEGMENT: &AsciiSet = &PATH.add(b'/').add(b'%');
 /// [`PATH_SEGMENT`], plus `\`, for special schemes where backslash is also
 /// a path separator.
-const SPECIAL_PATH_SEGMENT: &AsciiSet = &PATH_SEGMENT.add(b'\\');
+pub(crate) const SPECIAL_PATH_SEGMENT: &AsciiSet = &PATH_SEGMENT.add(b'\\');
 /// <https://url.spec.whatwg.org/#userinfo-percent-encode-set>
 pub(crate) const USERINFO: &AsciiSet = &PATH
     .add(b'/')
@@ -143,7 +143,7 @@ fn c0_control_or_space(c: char) -> bool {
     c <= ' '
 }
 
-fn ascii_alpha(c: char) -> bool {
+pub(crate) fn ascii_alpha(c: char) -> bool {
     c.is_ascii_alphabetic()
 }
 
@@ -1501,7 +1501,7 @@ fn first_path_segment(url: &Url) -> &str {
         .unwrap_or("")
 }
 
-fn is_windows_drive_letter(segment: &str) -> bool {
+pub(crate) fn is_windows_drive_letter(segment: &str) -> bool {
     let bytes = segment.as_bytes();
     bytes.len() == 2 && ascii_alpha(bytes[0] as char) && matches!(bytes[1], b':' | b'|')
 }

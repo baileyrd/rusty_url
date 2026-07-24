@@ -4,6 +4,7 @@
 //! in the repository root for the tracked parity roadmap.
 
 mod error;
+mod file_path;
 mod host;
 mod origin;
 mod parser;
