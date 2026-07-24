@@ -85,3 +85,16 @@
   (base-URL resolution, `parse_with_params`, six violation-triggering
   inputs, encoding-override applied vs. scheme-filtered-out, and a
   combined base+violation case) — byte-for-byte identical output. (#12)
+- Add `Url::from_file_path`/`Url::from_directory_path`/`Url::to_file_path`
+  for converting between `file:` URLs and `std::path::Path`. Platform-
+  conditional, matching the reference crate's split: Unix-like systems
+  treat paths as raw bytes under a single root, while Windows paths carry
+  a drive letter or UNC-share prefix that becomes the URL's host (ported
+  faithfully but only compile-checked, not run, since CI is Linux-only —
+  the string-manipulation half, `file_url_segments_to_pathbuf_windows`, is
+  additionally unit-tested directly since it doesn't depend on Windows-
+  specific `Path` parsing). Verified the Unix path against the reference
+  `url` crate across 13 cases (`from_file_path`/`from_directory_path`
+  success and error cases, joining off a directory vs. file base,
+  `to_file_path` including `localhost`/non-local-host/non-`file:`-scheme
+  rejection, and round-tripping) — byte-for-byte identical output. (#13)

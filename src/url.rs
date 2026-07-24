@@ -5,8 +5,17 @@ use std::fmt::{self, Write as _};
 use std::hash::{Hash, Hasher};
 use std::mem;
 use std::net::IpAddr;
+#[cfg(any(
+    unix,
+    windows,
+    target_os = "redox",
+    target_os = "wasi",
+    target_os = "hermit"
+))]
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use crate::file_path;
 use crate::form_urlencoded::EncodingOverride;
 use crate::host::{Host, HostInternal};
 use crate::origin::{self, Origin};
@@ -209,6 +218,93 @@ impl Url {
         }
 
         Some(relative)
+    }
+
+    /// Convert a file path into a `file:` URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `path` isn't absolute, or (on Windows) doesn't have
+    /// a disk or UNC prefix.
+    #[cfg(any(
+        unix,
+        windows,
+        target_os = "redox",
+        target_os = "wasi",
+        target_os = "hermit"
+    ))]
+    #[allow(clippy::result_unit_err)]
+    pub fn from_file_path<P: AsRef<Path>>(path: P) -> Result<Self, ()> {
+        let mut serialization = "file://".to_owned();
+        let host_start = serialization.len() as u32;
+        let (host_end, host) =
+            file_path::path_to_file_url_segments(path.as_ref(), &mut serialization)?;
+        Ok(Self {
+            serialization,
+            scheme_end: "file".len() as u32,
+            username_end: host_start,
+            host_start,
+            host_end,
+            host,
+            port: None,
+            path_start: host_end,
+            query_start: None,
+            fragment_start: None,
+        })
+    }
+
+    /// Convert a directory path into a `file:` URL, ensuring the result
+    /// ends with a trailing slash so it can be used as a base URL for
+    /// further relative paths under that directory.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Url::from_file_path`].
+    #[cfg(any(
+        unix,
+        windows,
+        target_os = "redox",
+        target_os = "wasi",
+        target_os = "hermit"
+    ))]
+    #[allow(clippy::result_unit_err)]
+    pub fn from_directory_path<P: AsRef<Path>>(path: P) -> Result<Self, ()> {
+        let mut url = Self::from_file_path(path)?;
+        if !url.serialization.ends_with('/') {
+            url.serialization.push('/');
+        }
+        Ok(url)
+    }
+
+    /// Convert this URL's path back to a `std::path::Path`, assuming it's a
+    /// `file:` URL or similar. Does not check `self.scheme()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the host is neither empty nor `"localhost"` (except
+    /// on Windows, where `file:` URLs may have a non-local host), or if the
+    /// percent-decoded path isn't representable as a `Path` on this
+    /// platform.
+    #[cfg(any(
+        unix,
+        windows,
+        target_os = "redox",
+        target_os = "wasi",
+        target_os = "hermit"
+    ))]
+    #[allow(clippy::result_unit_err)]
+    pub fn to_file_path(&self) -> Result<PathBuf, ()> {
+        let Some(segments) = self.path_segments() else {
+            return Err(());
+        };
+        let host = match self.host() {
+            None | Some(Host::Domain("localhost")) => None,
+            Some(_) if cfg!(windows) && self.scheme() == "file" => {
+                Some(&self.serialization[self.host_start as usize..self.host_end as usize])
+            }
+            _ => return Err(()),
+        };
+        file_path::file_url_segments_to_pathbuf(host, segments)
     }
 
     /// Return the serialization of this URL.
@@ -1758,5 +1854,101 @@ mod tests {
             .unwrap();
         // Override only applies to http/https/file/ftp; falls back to UTF-8.
         assert_eq!(url.query(), Some("q=caf%C3%A9"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn from_file_path_and_back_roundtrip() {
+        let url = Url::from_file_path("/tmp/foo bar.txt").unwrap();
+        assert_eq!(url.as_str(), "file:///tmp/foo%20bar.txt");
+        assert_eq!(
+            url.to_file_path().unwrap(),
+            std::path::PathBuf::from("/tmp/foo bar.txt")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn from_file_path_requires_absolute() {
+        assert!(Url::from_file_path("relative/path").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn from_directory_path_has_trailing_slash() {
+        let url = Url::from_directory_path("/var/www").unwrap();
+        assert_eq!(url.as_str(), "file:///var/www/");
+        let joined = url.join("index.html").unwrap();
+        assert_eq!(joined.as_str(), "file:///var/www/index.html");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn to_file_path_rejects_non_local_host() {
+        let url = Url::parse("file://example.net/foo").unwrap();
+        assert!(url.to_file_path().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn to_file_path_accepts_localhost() {
+        let url = Url::parse("file://localhost/foo/bar").unwrap();
+        assert_eq!(
+            url.to_file_path().unwrap(),
+            std::path::PathBuf::from("/foo/bar")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn to_file_path_fails_for_non_base_url() {
+        let url = Url::parse("data:text/plain,hi").unwrap();
+        assert!(url.to_file_path().is_err());
+    }
+
+    // `file_url_segments_to_pathbuf_windows` only manipulates strings (no
+    // platform-specific `Path` parsing), so it's kept available under
+    // `#[cfg(any(windows, test))]` and exercised directly here — CI runs on
+    // Linux, so this is the only way to cover the Windows URL->path
+    // direction. The reverse direction, `path_to_file_url_segments_windows`,
+    // depends on `Path::components()`'s platform-specific parsing of drive
+    // letters and UNC prefixes, which Linux's `std::path` doesn't perform,
+    // so it stays `#[cfg(windows)]`-only and untested here.
+    #[test]
+    fn windows_file_url_segments_to_pathbuf_disk() {
+        let path = crate::file_path::file_url_segments_to_pathbuf_windows(
+            None,
+            "C:/Users/me/file.txt".split('/'),
+        )
+        .unwrap();
+        assert_eq!(path, std::path::PathBuf::from(r"C:\Users\me\file.txt"));
+    }
+
+    #[test]
+    fn windows_file_url_segments_to_pathbuf_percent_encoded_drive() {
+        let path =
+            crate::file_path::file_url_segments_to_pathbuf_windows(None, "C%3A/dir".split('/'))
+                .unwrap();
+        assert_eq!(path, std::path::PathBuf::from(r"C:\dir"));
+    }
+
+    #[test]
+    fn windows_file_url_segments_to_pathbuf_unc_host() {
+        let segments = "share/dir/file.txt".split('/');
+        let path = crate::file_path::file_url_segments_to_pathbuf_windows(Some("server"), segments)
+            .unwrap();
+        assert_eq!(
+            path,
+            std::path::PathBuf::from(r"\\server\share\dir\file.txt")
+        );
+    }
+
+    #[test]
+    fn windows_file_url_segments_to_pathbuf_rejects_malformed_first_segment() {
+        assert!(crate::file_path::file_url_segments_to_pathbuf_windows(
+            None,
+            "notadrive".split('/')
+        )
+        .is_err());
     }
 }
