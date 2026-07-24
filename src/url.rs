@@ -430,6 +430,48 @@ impl Url {
         self.port.or_else(|| parser::default_port(self.scheme()))
     }
 
+    /// Resolve this URL's host and port to one or more [`SocketAddr`]s,
+    /// suitable for `TcpStream::connect`.
+    ///
+    /// A domain host is resolved via the standard library's DNS support. If
+    /// the URL's scheme has no [known default port](Url::port_or_known_default)
+    /// and it doesn't specify one explicitly, `default_port_number` is
+    /// called to supply one (e.g. `|| None`, or matching on `self.scheme()`
+    /// for an application-specific scheme).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::Error`](std::io::Error) if the URL has no host, has
+    /// no resolvable port, or (for a domain host) if DNS resolution fails.
+    #[cfg(any(
+        unix,
+        windows,
+        target_os = "redox",
+        target_os = "wasi",
+        target_os = "hermit"
+    ))]
+    pub fn socket_addrs(
+        &self,
+        default_port_number: impl Fn() -> Option<u16>,
+    ) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        use std::net::ToSocketAddrs;
+
+        fn io_result<T>(opt: Option<T>, message: &str) -> std::io::Result<T> {
+            opt.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, message))
+        }
+
+        let host = io_result(self.host(), "No host name in the URL")?;
+        let port = io_result(
+            self.port_or_known_default().or_else(default_port_number),
+            "No port number in the URL",
+        )?;
+        Ok(match host {
+            Host::Domain(domain) => (domain, port).to_socket_addrs()?.collect(),
+            Host::Ipv4(ip) => vec![(ip, port).into()],
+            Host::Ipv6(ip) => vec![(ip, port).into()],
+        })
+    }
+
     /// Return the path.
     pub fn path(&self) -> &str {
         match (self.query_start, self.fragment_start) {
@@ -1950,5 +1992,38 @@ mod tests {
             "notadrive".split('/')
         )
         .is_err());
+    }
+
+    #[test]
+    fn socket_addrs_ipv4_host_with_explicit_port() {
+        let url = Url::parse("http://127.0.0.1:9000/").unwrap();
+        let addrs = url.socket_addrs(|| None).unwrap();
+        assert_eq!(addrs, vec!["127.0.0.1:9000".parse().unwrap()]);
+    }
+
+    #[test]
+    fn socket_addrs_ipv6_host_falls_back_to_known_default_port() {
+        let url = Url::parse("https://[::1]/").unwrap();
+        let addrs = url.socket_addrs(|| None).unwrap();
+        assert_eq!(addrs, vec!["[::1]:443".parse().unwrap()]);
+    }
+
+    #[test]
+    fn socket_addrs_uses_default_port_number_callback_for_unknown_scheme() {
+        let url = Url::parse("socks5://127.0.0.1/").unwrap();
+        let addrs = url.socket_addrs(|| Some(1080)).unwrap();
+        assert_eq!(addrs, vec!["127.0.0.1:1080".parse().unwrap()]);
+    }
+
+    #[test]
+    fn socket_addrs_fails_without_a_port() {
+        let url = Url::parse("socks5://127.0.0.1/").unwrap();
+        assert!(url.socket_addrs(|| None).is_err());
+    }
+
+    #[test]
+    fn socket_addrs_fails_without_a_host() {
+        let url = Url::parse("data:text/plain,hi").unwrap();
+        assert!(url.socket_addrs(|| None).is_err());
     }
 }

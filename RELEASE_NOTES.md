@@ -98,3 +98,16 @@
   success and error cases, joining off a directory vs. file base,
   `to_file_path` including `localhost`/non-local-host/non-`file:`-scheme
   rejection, and round-tripping) — byte-for-byte identical output. (#13)
+- Add `Url::socket_addrs`, resolving a URL's host and port to one or more
+  `std::net::SocketAddr` (via the standard library's DNS support for a
+  domain host, or directly for an IP-literal host), with a caller-supplied
+  `default_port_number` fallback for schemes this crate doesn't know a
+  default port for. This closes the last tracked gap against the
+  reference `url` crate's public API surface. Verified against the
+  reference `url` crate across 6 deterministic cases (IPv4/IPv6-literal
+  hosts, explicit vs. known-default vs. callback-supplied port, and the
+  two error paths — no host, no resolvable port) — byte-for-byte
+  identical output. Domain-name resolution isn't covered by a
+  differential/unit test, since real DNS lookups would make the test
+  suite non-deterministic and network-dependent; the domain branch is a
+  direct, untransformed call into `(domain, port).to_socket_addrs()`. (#14)
