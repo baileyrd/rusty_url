@@ -71,3 +71,17 @@
   reference `url` crate — decoded-pairs iteration, append/clear/extend
   mutation, fragment preservation, and adding a query to a URL that had
   none — byte-for-byte identical output. (#11)
+- Add `ParseOptions`/`Url::options`/`SyntaxViolation`/`Url::parse_with_params`.
+  `ParseOptions` is a fluent builder (`base_url`/`encoding_override`/
+  `syntax_violation_callback`) over the parser's full configuration —
+  `Url::parse` and `Url::join` are now thin wrappers around it. Adds
+  `check_url_code_point`/`is_url_code_point` and threads non-fatal
+  `SyntaxViolation` reporting (backslash-as-separator, embedded
+  credentials, expected-`//`, NULL-in-fragment, bad `%XX`, non-URL code
+  points, etc.) through every parser state, plus a scheme-filtered
+  query-string `encoding_override` for legacy non-UTF-8 form encodings.
+  Purely additive — no parsed output changes when the callback/override
+  aren't set. Verified against the reference `url` crate across 11 cases
+  (base-URL resolution, `parse_with_params`, six violation-triggering
+  inputs, encoding-override applied vs. scheme-filtered-out, and a
+  combined base+violation case) — byte-for-byte identical output. (#12)

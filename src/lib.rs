@@ -17,6 +17,7 @@ pub mod form_urlencoded;
 pub use error::ParseError;
 pub use host::Host;
 pub use origin::{OpaqueOrigin, Origin};
+pub use parser::SyntaxViolation;
 pub use path_segments::PathSegmentsMut;
 pub use position::Position;
-pub use url::{Url, UrlQuery};
+pub use url::{ParseOptions, Url, UrlQuery};

@@ -7,9 +7,10 @@ use std::mem;
 use std::net::IpAddr;
 use std::str::FromStr;
 
+use crate::form_urlencoded::EncodingOverride;
 use crate::host::{Host, HostInternal};
 use crate::origin::{self, Origin};
-use crate::parser::{self, Parser, SchemeType, USERINFO};
+use crate::parser::{self, Parser, SchemeType, SyntaxViolation, USERINFO};
 use crate::percent_encode::utf8_percent_encode;
 use crate::ParseError;
 
@@ -32,6 +33,54 @@ pub struct Url {
     pub(crate) fragment_start: Option<u32>,
 }
 
+/// A fluent builder for [`Url::parse`], letting callers set a base URL, a
+/// query-string encoding override, and/or a [`SyntaxViolation`] callback
+/// before parsing. Build one with [`Url::options`].
+#[derive(Copy, Clone)]
+#[must_use]
+pub struct ParseOptions<'a> {
+    base_url: Option<&'a Url>,
+    encoding_override: EncodingOverride<'a>,
+    violation_fn: Option<&'a dyn Fn(SyntaxViolation)>,
+}
+
+impl<'a> ParseOptions<'a> {
+    /// Resolve the parsed URL against this base URL, as in [`Url::join`].
+    pub fn base_url(mut self, new: Option<&'a Url>) -> Self {
+        self.base_url = new;
+        self
+    }
+
+    /// Override the character encoding of the query string. A legacy
+    /// concept only relevant for HTML — see [`crate::form_urlencoded`].
+    pub fn encoding_override(mut self, new: EncodingOverride<'a>) -> Self {
+        self.encoding_override = new;
+        self
+    }
+
+    /// Call the given function for each non-fatal [`SyntaxViolation`]
+    /// encountered while parsing. The URL still parses successfully;
+    /// violations are purely informational.
+    pub fn syntax_violation_callback(mut self, new: Option<&'a dyn Fn(SyntaxViolation)>) -> Self {
+        self.violation_fn = new;
+        self
+    }
+
+    /// Parse a URL string with the configuration built up so far.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Url::parse`].
+    pub fn parse(self, input: &str) -> Result<Url, ParseError> {
+        Parser::parse_url_full(
+            input,
+            self.base_url,
+            self.encoding_override,
+            self.violation_fn,
+        )
+    }
+}
+
 impl Url {
     /// Parse an absolute URL from a string.
     ///
@@ -42,7 +91,36 @@ impl Url {
     /// against a base URL — or another [`ParseError`] variant if `input`
     /// is malformed.
     pub fn parse(input: &str) -> Result<Self, ParseError> {
-        Parser::parse_url(input)
+        Self::options().parse(input)
+    }
+
+    /// Parse an absolute URL from a string, then append `iter`'s pairs to
+    /// its query string (existing params, if any, are kept).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Url::parse`].
+    pub fn parse_with_params<I, K, V>(input: &str, iter: I) -> Result<Self, ParseError>
+    where
+        I: IntoIterator,
+        I::Item: std::borrow::Borrow<(K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut url = Self::options().parse(input)?;
+        url.query_pairs_mut().extend_pairs(iter);
+        Ok(url)
+    }
+
+    /// A fluent builder for parsing with a base URL, a query-string
+    /// encoding override, and/or a [`SyntaxViolation`] callback — see
+    /// [`ParseOptions`].
+    pub fn options<'a>() -> ParseOptions<'a> {
+        ParseOptions {
+            base_url: None,
+            encoding_override: None,
+            violation_fn: None,
+        }
     }
 
     /// Parse `input`, resolving it against `self` as a base URL if `input`
@@ -743,8 +821,9 @@ impl Url {
             self.query_start = Some(self.serialization.len() as u32);
             self.serialization.push('?');
             let scheme_type = SchemeType::from(self.scheme());
+            let scheme_end = self.scheme_end;
             self.mutate(|parser| {
-                parser.parse_query(scheme_type, parser::Input::new_no_trim(input))
+                parser.parse_query(scheme_type, scheme_end, parser::Input::new_no_trim(input))
             });
         } else {
             self.query_start = None;
@@ -1577,5 +1656,107 @@ mod tests {
         let mut url = Url::parse("https://example.net/path").unwrap();
         url.query_pairs_mut().append_pair("a", "1");
         assert_eq!(url.as_str(), "https://example.net/path?a=1");
+    }
+
+    #[test]
+    fn parse_with_params_appends_to_existing_query() {
+        let url = Url::parse_with_params(
+            "https://example.net?dont=clobberme",
+            &[("lang", "rust"), ("browser", "servo")],
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://example.net/?dont=clobberme&lang=rust&browser=servo"
+        );
+    }
+
+    #[test]
+    fn parse_with_params_propagates_parse_error() {
+        assert!(Url::parse_with_params("not a url", &[("a", "b")]).is_err());
+    }
+
+    #[test]
+    fn options_base_url_resolves_relative_input() {
+        let api = Url::parse("https://api.example.com").unwrap();
+        let options = Url::options().base_url(Some(&api));
+        let version_url = options.parse("version.json").unwrap();
+        assert_eq!(version_url.as_str(), "https://api.example.com/version.json");
+    }
+
+    #[test]
+    fn options_without_base_url_behaves_like_parse() {
+        let url = Url::options().parse("https://example.net/x").unwrap();
+        assert_eq!(url.as_str(), "https://example.net/x");
+    }
+
+    #[test]
+    fn syntax_violation_callback_reports_expected_double_slash() {
+        use std::cell::RefCell;
+        let violations = RefCell::new(Vec::new());
+        let url = Url::options()
+            .syntax_violation_callback(Some(&|v| violations.borrow_mut().push(v)))
+            .parse("https:////example.com")
+            .unwrap();
+        assert_eq!(url.as_str(), "https://example.com/");
+        assert_eq!(
+            violations.into_inner(),
+            vec![SyntaxViolation::ExpectedDoubleSlash]
+        );
+    }
+
+    #[test]
+    fn syntax_violation_callback_reports_backslash_and_embedded_credentials() {
+        use std::cell::RefCell;
+        let violations = RefCell::new(Vec::new());
+        let url = Url::options()
+            .syntax_violation_callback(Some(&|v| violations.borrow_mut().push(v)))
+            .parse("http://user:pass@example.com\\path")
+            .unwrap();
+        assert_eq!(url.as_str(), "http://user:pass@example.com/path");
+        let logged = violations.into_inner();
+        assert!(logged.contains(&SyntaxViolation::EmbeddedCredentials));
+        assert!(logged.contains(&SyntaxViolation::Backslash));
+    }
+
+    #[test]
+    fn syntax_violation_callback_silent_on_clean_input() {
+        use std::cell::RefCell;
+        let violations = RefCell::new(Vec::new());
+        Url::options()
+            .syntax_violation_callback(Some(&|v| violations.borrow_mut().push(v)))
+            .parse("https://example.net/clean/path?q=1")
+            .unwrap();
+        assert!(violations.into_inner().is_empty());
+    }
+
+    #[test]
+    fn encoding_override_applies_to_special_scheme_query() {
+        fn windows_1252_lossy(input: &str) -> std::borrow::Cow<'_, [u8]> {
+            if input.is_ascii() {
+                std::borrow::Cow::Borrowed(input.as_bytes())
+            } else {
+                std::borrow::Cow::Owned(input.chars().map(|c| c as u8).collect())
+            }
+        }
+        let url = Url::options()
+            .encoding_override(Some(&windows_1252_lossy))
+            .parse("https://example.net/?q=caf\u{e9}")
+            .unwrap();
+        // 'é' (U+00E9) is mapped to the single byte 0xE9, not UTF-8's 0xC3 0xA9.
+        assert_eq!(url.query(), Some("q=caf%E9"));
+    }
+
+    #[test]
+    fn encoding_override_ignored_for_non_special_scheme() {
+        fn windows_1252_lossy(input: &str) -> std::borrow::Cow<'_, [u8]> {
+            std::borrow::Cow::Owned(input.chars().map(|c| c as u8).collect())
+        }
+        let url = Url::options()
+            .encoding_override(Some(&windows_1252_lossy))
+            .parse("custom-scheme:x?q=caf\u{e9}")
+            .unwrap();
+        // Override only applies to http/https/file/ftp; falls back to UTF-8.
+        assert_eq!(url.query(), Some("q=caf%C3%A9"));
     }
 }
