@@ -1,18 +1,70 @@
-//! The [WHATWG basic URL parser](https://url.spec.whatwg.org/#url-parsing),
-//! covering both `Url::parse` (no base) and base-relative parsing
-//! (`Url::join`). A public `ParseOptions` builder over the same base-url
-//! machinery, plus encoding overrides and syntax-violation callbacks, is a
-//! later parity-loop issue.
+//! The [WHATWG basic URL parser](https://url.spec.whatwg.org/#url-parsing):
+//! `Url::parse` (no base), base-relative parsing (`Url::join`), and the
+//! full `ParseOptions` builder (base URL, encoding override, and
+//! syntax-violation reporting).
 
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::str::Chars;
 
+use crate::form_urlencoded::EncodingOverride;
 use crate::host::{Host, HostInternal};
-use crate::percent_encode::{utf8_percent_encode, AsciiSet, CONTROLS};
+use crate::percent_encode::{self, utf8_percent_encode, AsciiSet, CONTROLS};
 use crate::url::Url;
 use crate::ParseError;
 
 pub(crate) type ParseResult<T> = Result<T, ParseError>;
+
+/// Non-fatal syntax quirks noticed while parsing a URL — the URL still
+/// parses successfully, but the input wasn't "clean" (a stray backslash
+/// used as a path separator, embedded credentials, etc.). Report these via
+/// [`crate::ParseOptions::syntax_violation_callback`]; they have no effect
+/// on the parsed result.
+///
+/// This may be extended in the future, so exhaustive matching is forbidden.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SyntaxViolation {
+    Backslash,
+    C0SpaceIgnored,
+    EmbeddedCredentials,
+    ExpectedDoubleSlash,
+    ExpectedFileDoubleSlash,
+    FileWithHostAndWindowsDrive,
+    NonUrlCodePoint,
+    NullInFragment,
+    PercentDecode,
+    TabOrNewlineIgnored,
+    UnencodedAtSign,
+}
+
+impl SyntaxViolation {
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Backslash => "backslash",
+            Self::C0SpaceIgnored => {
+                "leading or trailing control or space character are ignored in URLs"
+            }
+            Self::EmbeddedCredentials => {
+                "embedding authentication information (username or password) \
+                 in an URL is not recommended"
+            }
+            Self::ExpectedDoubleSlash => "expected //",
+            Self::ExpectedFileDoubleSlash => "expected // after file:",
+            Self::FileWithHostAndWindowsDrive => "file: with host and Windows drive letter",
+            Self::NonUrlCodePoint => "non-URL code point",
+            Self::NullInFragment => "NULL characters are ignored in URL fragment identifiers",
+            Self::PercentDecode => "expected 2 hex digits after %",
+            Self::TabOrNewlineIgnored => "tabs or newlines are ignored in URLs",
+            Self::UnencodedAtSign => "unencoded @ sign in username or password",
+        }
+    }
+}
+
+impl fmt::Display for SyntaxViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.description())
+    }
+}
 
 /// <https://url.spec.whatwg.org/#fragment-percent-encode-set>
 const FRAGMENT: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'<').add(b'>').add(b'`');
@@ -107,8 +159,19 @@ pub(crate) struct Input<'i> {
 impl<'i> Input<'i> {
     /// Trims leading/trailing C0-control-or-space, matching
     /// <https://url.spec.whatwg.org/#url-parsing> steps 1-2.
-    fn new(original: &'i str) -> Self {
+    fn new_trim_c0_control_and_space(
+        original: &'i str,
+        vfn: Option<&dyn Fn(SyntaxViolation)>,
+    ) -> Self {
         let trimmed = original.trim_matches(c0_control_or_space);
+        if let Some(vfn) = vfn {
+            if trimmed.len() < original.len() {
+                vfn(SyntaxViolation::C0SpaceIgnored)
+            }
+            if trimmed.chars().any(ascii_tab_or_new_line) {
+                vfn(SyntaxViolation::TabOrNewlineIgnored)
+            }
+        }
         Input {
             chars: trimmed.chars(),
         }
@@ -125,6 +188,16 @@ impl<'i> Input<'i> {
 
     fn starts_with_char(&self, c: char) -> bool {
         self.clone().next() == Some(c)
+    }
+
+    fn starts_with_str(&self, s: &str) -> bool {
+        let mut remaining = self.clone();
+        for c in s.chars() {
+            if remaining.next() != Some(c) {
+                return false;
+            }
+        }
+        true
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -209,38 +282,40 @@ pub(crate) struct Parser<'a> {
     pub(crate) serialization: String,
     pub(crate) context: Context,
     base_url: Option<&'a Url>,
+    query_encoding_override: EncodingOverride<'a>,
+    violation_fn: Option<&'a dyn Fn(SyntaxViolation)>,
 }
 
 impl<'a> Parser<'a> {
-    /// <https://url.spec.whatwg.org/#concept-basic-url-parser>, without an
-    /// input base URL.
-    pub(crate) fn parse_url(input: &str) -> ParseResult<Url> {
-        let mut parser = Parser {
-            serialization: String::with_capacity(input.len()),
-            context: Context::UrlParser,
-            base_url: None,
-        };
-        let input = Input::new(input);
-        if let Ok(remaining) = parser.parse_scheme(input) {
-            return parser.parse_with_scheme(remaining);
-        }
-        Err(ParseError::RelativeUrlWithoutBase)
-    }
-
     /// <https://url.spec.whatwg.org/#concept-basic-url-parser>, resolving a
     /// possibly-relative `input` against `base_url` (`Url::join`).
     pub(crate) fn parse_url_with_base(input: &str, base_url: &'a Url) -> ParseResult<Url> {
+        Self::parse_url_full(input, Some(base_url), None, None)
+    }
+
+    /// The fully-configurable entry point backing [`crate::ParseOptions::parse`].
+    pub(crate) fn parse_url_full(
+        input: &str,
+        base_url: Option<&'a Url>,
+        query_encoding_override: EncodingOverride<'a>,
+        violation_fn: Option<&'a dyn Fn(SyntaxViolation)>,
+    ) -> ParseResult<Url> {
         let mut parser = Parser {
             serialization: String::with_capacity(input.len()),
             context: Context::UrlParser,
-            base_url: Some(base_url),
+            base_url,
+            query_encoding_override,
+            violation_fn,
         };
-        let input = Input::new(input);
+        let input = Input::new_trim_c0_control_and_space(input, violation_fn);
         if let Ok(remaining) = parser.parse_scheme(input.clone()) {
             return parser.parse_with_scheme(remaining);
         }
 
-        // No-scheme state: fall back to the base URL.
+        // No-scheme state: fall back to the base URL, if any.
+        let Some(base_url) = base_url else {
+            return Err(ParseError::RelativeUrlWithoutBase);
+        };
         if input.starts_with_char('#') {
             parser.fragment_only(base_url, input)
         } else if base_url.cannot_be_a_base() {
@@ -264,6 +339,22 @@ impl<'a> Parser<'a> {
             serialization,
             context: Context::Setter,
             base_url: None,
+            query_encoding_override: None,
+            violation_fn: None,
+        }
+    }
+
+    fn log_violation(&self, v: SyntaxViolation) {
+        if let Some(f) = self.violation_fn {
+            f(v)
+        }
+    }
+
+    fn log_violation_if(&self, v: SyntaxViolation, test: impl FnOnce() -> bool) {
+        if let Some(f) = self.violation_fn {
+            if test() {
+                f(v)
+            }
         }
     }
 
@@ -298,6 +389,9 @@ impl<'a> Parser<'a> {
         self.serialization.push(':');
         match scheme_type {
             SchemeType::File => {
+                self.log_violation_if(SyntaxViolation::ExpectedFileDoubleSlash, || {
+                    !input.starts_with_str("//")
+                });
                 let base_file_url = self.base_url.filter(|base| base.scheme() == "file");
                 self.serialization.clear();
                 self.parse_file(input, base_file_url)
@@ -312,6 +406,13 @@ impl<'a> Parser<'a> {
                         return self.parse_relative(input, scheme_type, base_url);
                     }
                 }
+                self.log_violation_if(SyntaxViolation::ExpectedDoubleSlash, || {
+                    input
+                        .clone()
+                        .take_while(|&c| matches!(c, '/' | '\\'))
+                        .collect::<String>()
+                        != "//"
+                });
                 self.after_double_slash(remaining, scheme_type, scheme_end)
             }
             SchemeType::NotSpecial => self.parse_non_special(input, scheme_type, scheme_end),
@@ -356,8 +457,10 @@ impl<'a> Parser<'a> {
         let scheme_end = "file".len() as u32;
         let (first_char, input_after_first_char) = input.split_first();
         if matches!(first_char, Some('/') | Some('\\')) {
+            self.log_violation_if(SyntaxViolation::Backslash, || first_char == Some('\\'));
             let (next_char, input_after_next_char) = input_after_first_char.split_first();
             if matches!(next_char, Some('/') | Some('\\')) {
+                self.log_violation_if(SyntaxViolation::Backslash, || next_char == Some('\\'));
                 // file host state
                 self.serialization.push_str("file://");
                 let host_start = "file://".len() as u32;
@@ -583,6 +686,13 @@ impl<'a> Parser<'a> {
             Some('/') | Some('\\') => {
                 let (slashes_count, remaining) = input.count_matching(|c| matches!(c, '/' | '\\'));
                 if slashes_count >= 2 {
+                    self.log_violation_if(SyntaxViolation::ExpectedDoubleSlash, || {
+                        input
+                            .clone()
+                            .take_while(|&c| matches!(c, '/' | '\\'))
+                            .collect::<String>()
+                            != "//"
+                    });
                     let scheme_end = base_url.scheme_end;
                     self.serialization
                         .push_str(&base_url.serialization[..scheme_end as usize + 1]);
@@ -711,7 +821,14 @@ impl<'a> Parser<'a> {
         let mut char_count = 0u32;
         while let Some(c) = remaining.next() {
             match c {
-                '@' => last_at = Some((char_count, remaining.clone())),
+                '@' => {
+                    if last_at.is_some() {
+                        self.log_violation(SyntaxViolation::UnencodedAtSign)
+                    } else {
+                        self.log_violation(SyntaxViolation::EmbeddedCredentials)
+                    }
+                    last_at = Some((char_count, remaining.clone()))
+                }
                 '/' | '?' | '#' => break,
                 '\\' if scheme_type.is_special() => break,
                 _ => (),
@@ -920,6 +1037,9 @@ impl<'a> Parser<'a> {
         let path_start = self.serialization.len();
         let (maybe_c, remaining) = input.split_first();
         if scheme_type.is_special() {
+            if maybe_c == Some('\\') {
+                self.log_violation(SyntaxViolation::Backslash);
+            }
             if !self.serialization.ends_with('/') {
                 self.serialization.push('/');
                 if maybe_c == Some('/') || maybe_c == Some('\\') {
@@ -1017,6 +1137,7 @@ impl<'a> Parser<'a> {
                             self.context,
                             scheme_type,
                         );
+                        self.log_violation(SyntaxViolation::Backslash);
                         self.serialization.push('/');
                         ends_with_slash = true;
                         break;
@@ -1032,7 +1153,9 @@ impl<'a> Parser<'a> {
                         input = input_before_c;
                         break;
                     }
-                    _ => {}
+                    _ => {
+                        self.check_url_code_point(c, &input);
+                    }
                 }
             }
 
@@ -1077,7 +1200,10 @@ impl<'a> Parser<'a> {
                         // https://url.spec.whatwg.org/#path-state step on
                         // Windows drive letters: a file: URL can't have both
                         // a host and a drive-letter path.
-                        *has_host = false;
+                        if *has_host {
+                            self.log_violation(SyntaxViolation::FileWithHostAndWindowsDrive);
+                            *has_host = false;
+                        }
                     }
                 }
             }
@@ -1136,7 +1262,8 @@ impl<'a> Parser<'a> {
                 Some(('?', _)) | Some(('#', _)) if self.context == Context::UrlParser => {
                     return input_before_c
                 }
-                Some((_, utf8_c)) => {
+                Some((c, utf8_c)) => {
+                    self.check_url_code_point(c, &input);
                     self.serialization
                         .push_str(&utf8_percent_encode(utf8_c, CONTROLS));
                 }
@@ -1197,7 +1324,7 @@ impl<'a> Parser<'a> {
             Some('?') => {
                 query_start = Some(to_u32(self.serialization.len())?);
                 self.serialization.push('?');
-                match self.parse_query(scheme_type, input) {
+                match self.parse_query(scheme_type, scheme_end, input) {
                     Some(remaining) => input = remaining,
                     None => return Ok((query_start, None)),
                 }
@@ -1219,6 +1346,7 @@ impl<'a> Parser<'a> {
     pub(crate) fn parse_query<'i>(
         &mut self,
         scheme_type: SchemeType,
+        scheme_end: u32,
         input: Input<'i>,
     ) -> Option<Input<'i>> {
         let set = if scheme_type.is_special() {
@@ -1226,6 +1354,12 @@ impl<'a> Parser<'a> {
         } else {
             QUERY
         };
+        let encoding_override = self.query_encoding_override.filter(|_| {
+            matches!(
+                &self.serialization[..scheme_end as usize],
+                "http" | "https" | "file" | "ftp"
+            )
+        });
         let mut input = input;
         loop {
             let start = input.chars.as_str();
@@ -1235,21 +1369,23 @@ impl<'a> Parser<'a> {
                     None => {
                         let text = &start[..start.len() - before_len];
                         if !text.is_empty() {
-                            self.serialization.push_str(&utf8_percent_encode(text, set));
+                            push_encoded(&mut self.serialization, text, set, encoding_override);
                         }
                         return None;
                     }
                     Some('\t') | Some('\n') | Some('\r') => {
                         let text = &start[..start.len() - before_len];
-                        self.serialization.push_str(&utf8_percent_encode(text, set));
+                        push_encoded(&mut self.serialization, text, set, encoding_override);
                         break;
                     }
                     Some('#') if self.context == Context::UrlParser => {
                         let text = &start[..start.len() - before_len];
-                        self.serialization.push_str(&utf8_percent_encode(text, set));
+                        push_encoded(&mut self.serialization, text, set, encoding_override);
                         return Some(input);
                     }
-                    Some(_) => {}
+                    Some(c) => {
+                        self.check_url_code_point(c, &input);
+                    }
                 }
             }
         }
@@ -1276,11 +1412,82 @@ impl<'a> Parser<'a> {
                             .push_str(&utf8_percent_encode(text, FRAGMENT));
                         break;
                     }
-                    Some(_) => {}
+                    Some('\0') => {
+                        self.log_violation(SyntaxViolation::NullInFragment);
+                    }
+                    Some(c) => {
+                        self.check_url_code_point(c, &input);
+                    }
                 }
             }
         }
     }
+
+    #[inline]
+    fn check_url_code_point(&self, c: char, input: &Input<'_>) {
+        if let Some(vfn) = self.violation_fn {
+            check_url_code_point(vfn, c, input)
+        }
+    }
+}
+
+/// Percent-encode `text`, running it through `encoding_override` first if
+/// present (used for `query_encoding_override`, which may replace the query
+/// string's bytes with a non-UTF-8 legacy encoding).
+fn push_encoded(
+    serialization: &mut String,
+    text: &str,
+    set: &'static AsciiSet,
+    encoding_override: EncodingOverride<'_>,
+) {
+    match encoding_override {
+        Some(o) => {
+            let overridden = o(text);
+            let encoded = percent_encode::percent_encode(&overridden, set);
+            serialization
+                .push_str(std::str::from_utf8(&encoded).expect("percent-encoding is ASCII-only"));
+        }
+        None => serialization.push_str(&utf8_percent_encode(text, set)),
+    }
+}
+
+fn check_url_code_point(vfn: &dyn Fn(SyntaxViolation), c: char, input: &Input<'_>) {
+    if c == '%' {
+        let mut input = input.clone();
+        if !matches!((input.next(), input.next()), (Some(a), Some(b))
+            if a.is_ascii_hexdigit() && b.is_ascii_hexdigit())
+        {
+            vfn(SyntaxViolation::PercentDecode)
+        }
+    } else if !is_url_code_point(c) {
+        vfn(SyntaxViolation::NonUrlCodePoint)
+    }
+}
+
+// Non URL code points:
+// U+0000 to U+0020 (space)
+// " # % < > [ \ ] ^ ` { | }
+// U+007F to U+009F
+// surrogates
+// U+FDD0 to U+FDEF
+// Last two of each plane: U+__FFFE to U+__FFFF for __ in 00 to 10 hex
+#[inline]
+fn is_url_code_point(c: char) -> bool {
+    matches!(c,
+        'a'..='z' |
+        'A'..='Z' |
+        '0'..='9' |
+        '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | '-' |
+        '.' | '/' | ':' | ';' | '=' | '?' | '@' | '_' | '~' |
+        '\u{A0}'..='\u{D7FF}' | '\u{E000}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}' |
+        '\u{10000}'..='\u{1FFFD}' | '\u{20000}'..='\u{2FFFD}' |
+        '\u{30000}'..='\u{3FFFD}' | '\u{40000}'..='\u{4FFFD}' |
+        '\u{50000}'..='\u{5FFFD}' | '\u{60000}'..='\u{6FFFD}' |
+        '\u{70000}'..='\u{7FFFD}' | '\u{80000}'..='\u{8FFFD}' |
+        '\u{90000}'..='\u{9FFFD}' | '\u{A0000}'..='\u{AFFFD}' |
+        '\u{B0000}'..='\u{BFFFD}' | '\u{C0000}'..='\u{CFFFD}' |
+        '\u{D0000}'..='\u{DFFFD}' | '\u{E1000}'..='\u{EFFFD}' |
+        '\u{F0000}'..='\u{FFFFD}' | '\u{100000}'..='\u{10FFFD}')
 }
 
 /// The first `/`-separated path segment, or `""` for a cannot-be-a-base URL

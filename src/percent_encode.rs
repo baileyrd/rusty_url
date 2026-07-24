@@ -76,6 +76,24 @@ pub(crate) fn utf8_percent_encode<'a>(
     Cow::Owned(out)
 }
 
+/// Percent-encode raw bytes, escaping bytes in `ascii_set` (and all
+/// non-ASCII bytes). Unlike [`utf8_percent_encode`], `input` need not be
+/// valid UTF-8 (used for `query_encoding_override` results).
+pub(crate) fn percent_encode<'a>(input: &'a [u8], ascii_set: &'static AsciiSet) -> Cow<'a, [u8]> {
+    if !input.iter().any(|&b| ascii_set.should_percent_encode(b)) {
+        return Cow::Borrowed(input);
+    }
+    let mut out = Vec::with_capacity(input.len());
+    for &byte in input {
+        if ascii_set.should_percent_encode(byte) {
+            out.extend_from_slice(percent_encode_byte(byte).as_bytes());
+        } else {
+            out.push(byte);
+        }
+    }
+    Cow::Owned(out)
+}
+
 fn after_percent_sign(bytes: &[u8], i: &mut usize) -> Option<u8> {
     let h = (*bytes.get(*i)? as char).to_digit(16)?;
     let l = (*bytes.get(*i + 1)? as char).to_digit(16)?;
