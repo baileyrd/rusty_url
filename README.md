@@ -1,5 +1,13 @@
 # rusty_url
 
+> **This repo has moved.** `rusty_url` now lives at
+> [`crates/rusty_url`](https://github.com/Rusty-Mill/rusty_mill/tree/main/crates/rusty_url)
+> in the [`rusty_mill`](https://github.com/Rusty-Mill/rusty_mill) monorepo,
+> merged in with its full commit history via `git subtree`. This repo is
+> kept for historical reference (issues, PRs, prior releases) but is no
+> longer where development happens -- open new issues and PRs against
+> `rusty_mill` instead.
+
 [![CI](https://github.com/baileyrd/rusty_url/actions/workflows/ci.yml/badge.svg)](https://github.com/baileyrd/rusty_url/actions/workflows/ci.yml)
 
 A from-scratch implementation of the [WHATWG URL Living Standard](https://url.spec.whatwg.org/),
